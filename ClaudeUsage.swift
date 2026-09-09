@@ -423,19 +423,6 @@ func usageColor(_ percent: Double) -> NSColor {
     return .systemGreen
 }
 
-/// Draws the solid rounded background. Menus are always rendered with a
-/// translucent system material, so the details live in a panel we paint.
-final class PanelBackgroundView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 12, yRadius: 12)
-        NSColor.windowBackgroundColor.setFill()
-        path.fill()
-        NSColor.separatorColor.setStroke()
-        path.lineWidth = 1
-        path.stroke()
-    }
-}
-
 final class MeterView: NSView {
     private let percent: Double
 
@@ -462,15 +449,18 @@ final class MeterView: NSView {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let panelWidth: CGFloat = 300
-    private static let panelInset: CGFloat = 14
-    private static let contentWidth: CGFloat = panelWidth - panelInset * 2
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private static let menuWidth: CGFloat = 300
+    private static let menuInset: CGFloat = 12
+    private static let contentWidth: CGFloat = menuWidth - menuInset * 2
 
     private var statusItem: NSStatusItem!
-    private var panel: NSPanel!
+    private var menu: NSMenu!
+    private var contentItem: NSMenuItem!
+    private var contentStack: NSStackView!
+    private var contentView: NSView!
+    private var menuIsOpen = false
     private var timer: Timer?
-    private var clickMonitors: [Any] = []
     private var snapshot: UsageSnapshot?
     private var refreshError: String?
     private var refreshing = false
@@ -480,23 +470,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(togglePanel)
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
-        panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth, height: 100),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: true
-        )
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.level = .popUpMenu
-        panel.isMovable = false
-        panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // The details live in a real menu rather than a floating panel: macOS
+        // only keeps an auto-hiding menu bar pulled down while a menu tracks.
+        buildContentView()
+        contentItem = NSMenuItem()
+        contentItem.view = contentView
+        menu = NSMenu()
+        menu.delegate = self
+        menu.addItem(contentItem)
+        statusItem.menu = menu
 
         snapshot = Cache.load()
         render()
@@ -557,78 +540,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func scheduleRefresh(after interval: TimeInterval) {
         timer?.invalidate()
         let wait = max(interval, 5)
-        timer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
+        let scheduled = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        // Menu tracking runs its own run loop mode; without .common the refresh
+        // would stall for as long as the menu stays open.
+        RunLoop.main.add(scheduled, forMode: .common)
+        timer = scheduled
     }
 
     private func render() {
         renderTitle()
-        if panel != nil, panel.isVisible {
-            rebuildPanel()
+        if menuIsOpen {
+            rebuildContent()
         }
     }
 
-    @objc private func togglePanel() {
-        if panel.isVisible {
-            closePanel()
-        } else {
-            openPanel()
-        }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildContent()
     }
 
-    private func openPanel() {
-        rebuildPanel()
-        panel.orderFrontRegardless()
-        statusItem.button?.highlight(true)
-        installClickMonitors()
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
     }
 
-    @objc private func closePanel() {
-        clickMonitors.forEach(NSEvent.removeMonitor)
-        clickMonitors.removeAll()
-        panel.orderOut(nil)
-        statusItem.button?.highlight(false)
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 
-    private func installClickMonitors() {
-        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
-        if let outside = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
-            DispatchQueue.main.async { self?.closePanel() }
-        }) {
-            clickMonitors.append(outside)
-        }
-        if let inside = NSEvent.addLocalMonitorForEvents(matching: clicks, handler: { [weak self] event in
-            guard let self else { return event }
-            // The status item handles its own clicks, otherwise it would reopen
-            // the panel this monitor just closed.
-            if event.window !== self.panel && event.window !== self.statusItem.button?.window {
-                self.closePanel()
-            }
-            return event
-        }) {
-            clickMonitors.append(inside)
-        }
-    }
-
-    private func rebuildPanel() {
-        let background = PanelBackgroundView()
+    private func buildContentView() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.menuWidth, height: 100))
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(stack)
+        container.addSubview(stack)
 
-        let inset = Self.panelInset
+        let inset = Self.menuInset
         NSLayoutConstraint.activate([
-            background.widthAnchor.constraint(equalToConstant: Self.panelWidth),
-            stack.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: inset),
-            stack.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -inset),
-            stack.topAnchor.constraint(equalTo: background.topAnchor, constant: inset),
-            stack.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -inset)
+            container.widthAnchor.constraint(equalToConstant: Self.menuWidth),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: inset),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -inset),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: inset),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -inset)
         ])
 
+        contentView = container
+        contentStack = stack
+    }
+
+    private func rebuildContent() {
+        let stack = contentStack!
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        let inset = Self.menuInset
         if let snapshot {
             stack.addArrangedSubview(meterRow(snapshot.fiveHour))
             stack.addArrangedSubview(meterRow(snapshot.weekly))
@@ -650,7 +619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             warning.textColor = .systemOrange
             warning.lineBreakMode = .byWordWrapping
             warning.maximumNumberOfLines = 3
-            warning.preferredMaxLayoutWidth = Self.panelWidth - inset * 2
+            warning.preferredMaxLayoutWidth = Self.menuWidth - inset * 2
             warning.toolTip = refreshError
             stack.addArrangedSubview(warning)
         }
@@ -662,21 +631,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
         }
 
-        panel.contentView = background
-        background.layoutSubtreeIfNeeded()
-        positionPanel(size: background.fittingSize)
-    }
-
-    private func positionPanel(size: NSSize) {
-        guard let button = statusItem.button, let window = button.window else { return }
-        let buttonFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
-        var x = buttonFrame.midX - size.width / 2
-        if let screen = window.screen ?? NSScreen.main {
-            let visible = screen.visibleFrame
-            x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
-        }
-        let frame = NSRect(x: x, y: buttonFrame.minY - size.height - 6, width: size.width, height: size.height)
-        panel.setFrame(frame, display: true)
+        contentView.layoutSubtreeIfNeeded()
+        contentView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: Self.menuWidth,
+            height: contentView.fittingSize.height
+        )
     }
 
     private func statusText() -> String {
@@ -878,6 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() {
+        menu.cancelTracking()
         NSApp.terminate(nil)
     }
 }
